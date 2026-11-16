@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# AppRun for the Odysseus AppImage.
+set -euo pipefail
+
+HERE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+PY="$HERE/usr/python/bin/python3"
+export ODYSSEUS_APP_ROOT="$HERE/usr/share/odysseus"
+
+# The AppImage is read-only: never try to write .pyc files into it,
+# and don't pick up packages from the user's ~/.local site-packages.
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONNOUSERSITE=1
+unset PYTHONHOME PYTHONPATH
+
+# Version/commit baked in at build time (there is no .git inside the image).
+if [[ -f "$ODYSSEUS_APP_ROOT/SOURCE_COMMIT" ]]; then
+  export ODYSSEUS_SOURCE_COMMIT="${ODYSSEUS_SOURCE_COMMIT:-$(<"$ODYSSEUS_APP_ROOT/SOURCE_COMMIT")}"
+fi
+
+# The bundled Python has OpenSSL linked in; point it at the distro CA bundle.
+if [[ -z "${SSL_CERT_FILE:-}" ]]; then
+  for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt \
+           /etc/ssl/ca-bundle.pem /etc/ssl/cert.pem; do
+    if [[ -r "$f" ]]; then export SSL_CERT_FILE="$f"; break; fi
+  done
+fi
+
+exec "$PY" -I -B "$HERE/usr/share/odysseus-launcher.py" "$@"

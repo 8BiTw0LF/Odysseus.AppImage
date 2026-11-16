@@ -1,0 +1,122 @@
+name: Build Odysseus AppImage
+
+# Checks odysseus-dev/odysseus every 6 hours. When upstream has a new commit,
+# a fresh AppImage is built and published as the "latest" release of THIS
+# repository. The AppImage embeds
+#   gh-releases-zsync|<this owner>|<this repo>|latest|Odysseus-*-x86_64.AppImage.zsync
+# so Gear Lever (and AppImageUpdate) pick up new versions automatically.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if upstream has not changed"
+        type: boolean
+        default: false
+      ref:
+        description: "Upstream branch/tag to build"
+        default: "main"
+  push:
+    branches: [main]
+    paths:
+      - "build-appimage.sh"
+      - "packaging/**"
+      - ".github/workflows/build-appimage.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: appimage
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/odysseus-dev/odysseus.git
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check upstream for changes
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref || 'main' }}
+        run: |
+          upstream=$(git ls-remote "$UPSTREAM" "refs/heads/$REF" "refs/tags/$REF" | head -1 | cut -f1)
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          # Commit of the newest release is stored in its body as "commit: <sha>".
+          last=$(gh release view --repo "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null \
+                 | sed -n 's/^commit: \([0-9a-f]\{40\}\).*/\1/p' | head -1 || true)
+          echo "Upstream: $upstream   Last released: ${last:-none}"
+          if [[ "$upstream" == "$last" && "${{ inputs.force }}" != "true" && "${{ github.event_name }}" != "push" ]]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install build tools
+        if: steps.check.outputs.build == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends file zsync desktop-file-utils
+
+      - uses: astral-sh/setup-uv@v6
+        if: steps.check.outputs.build == 'true'
+
+      - name: Clone upstream
+        if: steps.check.outputs.build == 'true'
+        run: |
+          git clone "$UPSTREAM" build/odysseus
+          git -C build/odysseus checkout "${{ steps.check.outputs.upstream }}"
+
+      - name: Build AppImage
+        if: steps.check.outputs.build == 'true'
+        id: build
+        run: ./build-appimage.sh build/odysseus dist
+
+      - name: Smoke test
+        if: steps.check.outputs.build == 'true'
+        run: |
+          app="${{ steps.build.outputs.file }}"
+          export APPIMAGE_EXTRACT_AND_RUN=1 HOME="$RUNNER_TEMP/home"
+          "$app" --version
+          "$app" --no-browser > "$RUNNER_TEMP/run.log" 2>&1 &
+          for i in $(seq 1 90); do
+            curl -fs -o /dev/null http://127.0.0.1:7000/login && break; sleep 2
+          done
+          curl -fsS http://127.0.0.1:7000/api/auth/status
+          "$app" --stop || true
+          readelf --string-dump=.upd_info --wide "$app" | grep gh-releases-zsync
+
+      - name: Publish release
+        if: steps.check.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.build.outputs.tag }}
+          COMMIT: ${{ steps.build.outputs.commit }}
+          VERSION: ${{ steps.build.outputs.version }}
+        run: |
+          notes="Odysseus $VERSION built from upstream odysseus-dev/odysseus@${COMMIT:0:7}
+
+          commit: $COMMIT
+          https://github.com/odysseus-dev/odysseus/commit/$COMMIT"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber "${{ steps.build.outputs.file }}" "${{ steps.build.outputs.zsync }}"
+            gh release edit "$TAG" --latest --notes "$notes"
+          else
+            gh release create "$TAG" --latest --title "Odysseus $VERSION (${COMMIT:0:7})" \
+              --notes "$notes" "${{ steps.build.outputs.file }}" "${{ steps.build.outputs.zsync }}"
+          fi
+
+      - name: Prune old releases (keep 5)
+        if: steps.check.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 100 --json tagName,createdAt -q 'sort_by(.createdAt) | reverse | .[5:] | .[].tagName' \
+            | xargs -r -I{} gh release delete {} --yes --cleanup-tag
